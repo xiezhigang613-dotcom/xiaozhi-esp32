@@ -200,7 +200,7 @@ private:
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
         ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
-        
+
         esp_lcd_panel_reset(panel);
         pca9557_->SetOutputState(0, 0);
 
@@ -225,7 +225,7 @@ private:
             .x_max = DISPLAY_HEIGHT,
             .y_max = DISPLAY_WIDTH,
             .rst_gpio_num = GPIO_NUM_NC, // Shared with LCD reset
-            .int_gpio_num = GPIO_NUM_NC, 
+            .int_gpio_num = GPIO_NUM_NC,
             .levels = {
                 .reset = 0,
                 .interrupt = 0,
@@ -238,7 +238,7 @@ private:
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = {
-            .dev_addr = ESP_LCD_TOUCH_IO_I2C_ADDRESS,
+            .dev_addr = ESP_LCD_TOUCH_IO_I2C_FT5x06_ADDRESS,
             .control_phase_bytes = 1,
             .dc_bit_offset = 0,
             .lcd_cmd_bits = 8,
@@ -261,7 +261,7 @@ private:
 
         /* Add touch input (for selected screen) */
         const lvgl_port_touch_cfg_t touch_cfg = {
-            .disp = lv_display_get_default(), 
+            .disp = lv_display_get_default(),
             .handle = tp,
         };
 
@@ -375,7 +375,7 @@ public:
 
     virtual AudioCodec* GetAudioCodec() override {
         static CustomAudioCodec audio_codec(
-            i2c_bus_, 
+            i2c_bus_,
             pca9557_);
         return &audio_codec;
     }
@@ -383,7 +383,7 @@ public:
     virtual Display* GetDisplay() override {
         return display_;
     }
-    
+
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
