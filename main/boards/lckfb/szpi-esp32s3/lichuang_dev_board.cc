@@ -13,6 +13,7 @@
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
+#include <driver/ledc.h>
 #include <driver/spi_common.h>
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
@@ -59,6 +60,46 @@ public:
     }
 };
 
+/*
+ * Simple LEDC-based hobby servo driver (50 Hz, 13-bit, 500~2500 us pulse).
+ * Uses LEDC_TIMER_3 and channels 4/5: the backlight already occupies
+ * TIMER_0/CHANNEL_0 and the camera XCLK occupies TIMER_2/CHANNEL_2.
+ */
+#define SERVO_PWM_FREQ_HZ   50
+#define SERVO_PULSE_MIN_US  500
+#define SERVO_PULSE_MAX_US  2500
+#define SERVO_PWM_PERIOD_US 20000
+#define SERVO_PWM_MAX_DUTY  ((1 << 13) - 1)
+
+class Servo {
+public:
+    Servo(gpio_num_t pin, ledc_channel_t channel) : pin_(pin), channel_(channel) {}
+
+    void Init() {
+        ledc_channel_config_t ch_conf = {};
+        ch_conf.gpio_num = pin_;
+        ch_conf.speed_mode = LEDC_LOW_SPEED_MODE;
+        ch_conf.channel = channel_;
+        ch_conf.timer_sel = LEDC_TIMER_3;
+        ch_conf.duty = 0;
+        ch_conf.hpoint = 0;
+        ESP_ERROR_CHECK(ledc_channel_config(&ch_conf));
+    }
+
+    void SetAngle(int angle) {
+        int pulse_us = SERVO_PULSE_MIN_US +
+                       (SERVO_PULSE_MAX_US - SERVO_PULSE_MIN_US) * angle / 180;
+        uint32_t duty = pulse_us * SERVO_PWM_MAX_DUTY / SERVO_PWM_PERIOD_US;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, channel_, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, channel_);
+        ESP_LOGI(TAG, "Servo ch%d angle=%d", channel_, angle);
+    }
+
+private:
+    gpio_num_t pin_;
+    ledc_channel_t channel_;
+};
+
 class LichuangDevBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
@@ -68,6 +109,8 @@ private:
     Pca9557* pca9557_;
     Esp32Camera* camera_;
     PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
+    Servo* pan_servo_ = nullptr;
+    Servo* tilt_servo_ = nullptr;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -195,7 +238,7 @@ private:
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = {
-            .dev_addr = ESP_LCD_TOUCH_IO_I2C_FT5x06_ADDRESS,
+            .dev_addr = ESP_LCD_TOUCH_IO_I2C_ADDRESS,
             .control_phase_bytes = 1,
             .dc_bit_offset = 0,
             .lcd_cmd_bits = 8,
@@ -264,6 +307,21 @@ private:
         camera_ = new Esp32Camera(config);
     }
 
+    void InitializeServos() {
+        ledc_timer_config_t timer_conf = {};
+        timer_conf.speed_mode = LEDC_LOW_SPEED_MODE;
+        timer_conf.duty_resolution = LEDC_TIMER_13_BIT;
+        timer_conf.timer_num = LEDC_TIMER_3;
+        timer_conf.freq_hz = SERVO_PWM_FREQ_HZ;
+        timer_conf.clk_cfg = LEDC_AUTO_CLK;
+        ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
+
+        pan_servo_ = new Servo(SERVO_PAN_PIN, LEDC_CHANNEL_4);
+        tilt_servo_ = new Servo(SERVO_TILT_PIN, LEDC_CHANNEL_5);
+        pan_servo_->Init();
+        tilt_servo_->Init();
+    }
+
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.system.reconfigure_wifi",
@@ -272,6 +330,29 @@ private:
             PropertyList(), [this](const PropertyList& properties) {
                 EnterWifiConfigMode();
                 return true;
+            });
+
+        // Pan-tilt servos on the multi-purpose expansion connector (IO10 / IO11)
+        InitializeServos();
+        mcp_server.AddTool("self.servo.set_angle",
+            "设置桌面机器人摇头舵机的角度。舵机接在板子的外拓接口（多用）上。\n"
+            "channel: 1 = 水平转动（pan，左右摇头），2 = 俯仰（tilt，点头）。\n"
+            "angle: 0~180 度，90 度为中间位置。",
+            PropertyList({
+                Property("channel", kPropertyTypeInteger, 1, 1, 2),
+                Property("angle", kPropertyTypeInteger, 90, 0, 180)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int channel = properties["channel"].value<int>();
+                int angle = properties["angle"].value<int>();
+                if (channel == 1) {
+                    pan_servo_->SetAngle(angle);
+                } else {
+                    tilt_servo_->SetAngle(angle);
+                }
+                char message[64];
+                snprintf(message, sizeof(message), "舵机 %d 已转到 %d 度", channel, angle);
+                return std::string(message);
             });
 
         // Allow switching between press-to-talk (长按说话) and click-to-talk (单击唤醒)

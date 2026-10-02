@@ -58,5 +58,11 @@
 
 #define XCLK_FREQ_HZ 20000000
 
+/* Pan-tilt servos wired to the multi-purpose expansion connector (J2, GH1.25):
+ *  pin 1 = IO11, pin 2 = IO10, pin 3 = GND, pin 4 = 3V3, pin 5 = VBUS.
+ *  Servos are powered from an external 5V supply sharing ground with the board. */
+#define SERVO_PAN_PIN  GPIO_NUM_10
+#define SERVO_TILT_PIN GPIO_NUM_11
+
 
 #endif // _BOARD_CONFIG_H_
