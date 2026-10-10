@@ -64,5 +64,28 @@
 #define SERVO_PAN_PIN  GPIO_NUM_10
 #define SERVO_TILT_PIN GPIO_NUM_11
 
+/* Drive board: PCA9685 16-channel PWM expander hanging off the I2C expansion
+ * connector (J1: IO1_SDA / IO2_SCL / 3V3 / VBUS / GND), sharing the on-board
+ * I2C1 bus with the audio codec (0x18), the PCA9557 (0x19) and the camera SCCB
+ * (0x1E). It brings its own 25 MHz oscillator, so it does not touch the ESP32
+ * LEDC timers already used by the pan/tilt servos and the display backlight.
+ * Its outputs feed a TB6612FNG bridge that drives two N20 gear motors. */
+#define PCA9685_I2C_ADDR       0x40
+#define PCA9685_PWM_FREQ_HZ    1000
+
+/* PCA9685 output channel -> TB6612FNG pin */
+#define MOTOR_LEFT_INA_CH      0
+#define MOTOR_LEFT_INB_CH      1
+#define MOTOR_LEFT_PWM_CH      2
+#define MOTOR_RIGHT_INA_CH     3
+#define MOTOR_RIGHT_INB_CH     4
+#define MOTOR_RIGHT_PWM_CH     5
+
+/* Fallback brain: if the NVS "wifi" namespace has no ota_url (fresh flash, or the
+ * field was cleared in the provisioning portal), point the device at the
+ * self-hosted xiaozhi-esp32-server on the LAN instead of the official cloud.
+ * Set it from the portal (Advanced tab) at any time to override or go back. */
+#define LOCAL_OTA_URL "http://192.168.10.114:8003/xiaozhi/ota/"
+
 
 #endif // _BOARD_CONFIG_H_

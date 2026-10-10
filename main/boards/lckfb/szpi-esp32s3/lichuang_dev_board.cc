@@ -7,6 +7,7 @@
 #include "config.h"
 #include "i2c_device.h"
 #include "esp32_camera.h"
+#include "settings.h"
 #include "mcp_server.h"
 #include "press_to_talk_mcp_tool.h"
 
@@ -15,6 +16,10 @@
 #include <driver/i2c_master.h>
 #include <driver/ledc.h>
 #include <driver/spi_common.h>
+#include <driver/esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <cstdlib>
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
@@ -100,6 +105,161 @@ private:
     ledc_channel_t channel_;
 };
 
+/*
+ * PCA9685 16-channel PWM / LED driver on the I2C expansion connector (J1).
+ * It has its own 25 MHz oscillator, so unlike the LEDC-based servos above it
+ * costs the ESP32 no timers and keeps a rock-steady 50 Hz~1.9 kHz signal.
+ * 12-bit duty resolution: a channel is low while counter < on, high from
+ * counter >= off, and OFF_H bit 4 forces the line fully high / fully low.
+ */
+#define PCA9685_REG_MODE1          0x00
+#define PCA9685_REG_MODE2          0x01
+#define PCA9685_REG_LED0_ON_L      0x06
+#define PCA9685_REG_ALL_LED_ON_L   0xfa
+#define PCA9685_REG_ALL_LED_OFF_L  0xfc
+#define PCA9685_REG_PRE_SCALE      0xfe
+
+#define PCA9685_MODE1_AI           (1 << 4)   // register address auto-increment
+#define PCA9685_MODE1_SLEEP        (1 << 5)
+#define PCA9685_MODE1_RESTART      (1 << 7)
+#define PCA9685_MODE2_OUTDRV       (1 << 2)   // totem-pole outputs
+#define PCA9685_MODE2_OUTRE        (1 << 0)   // outputs respond when OE is low
+#define PCA9685_MAX_DUTY           4096
+#define PCA9685_OSC_FREQ_HZ        25000000
+#define PCA9685_CHANNEL_STRIDE     4
+#define PCA9685_FULL_ON            (1 << 4)   // bit 4 of OFF_H: output held high all period
+#define PCA9685_FULL_OFF           (1 << 4)   // bit 4 of ON_H:  output held low all period
+
+class Pca9685 : public I2cDevice {
+public:
+    Pca9685(i2c_master_bus_handle_t i2c_bus, uint8_t addr, uint32_t freq_hz)
+        : I2cDevice(i2c_bus, addr) {
+        // prescale = round(osc / (4096 * freq)) - 1, valid for 24..1526 Hz
+        uint32_t prescale = (PCA9685_OSC_FREQ_HZ + freq_hz * 2048) / (freq_hz * 4096) - 1;
+        if (prescale < 3) {
+            prescale = 3;
+        }
+        if (prescale > 255) {
+            prescale = 255;
+        }
+
+        uint8_t mode1 = ReadReg(PCA9685_REG_MODE1);
+        WriteReg(PCA9685_REG_MODE1, (mode1 & ~PCA9685_MODE1_AI) | PCA9685_MODE1_SLEEP);
+        WriteReg(PCA9685_REG_PRE_SCALE, static_cast<uint8_t>(prescale));
+        vTaskDelay(pdMS_TO_TICKS(5));
+        mode1 = (mode1 | PCA9685_MODE1_AI) & ~PCA9685_MODE1_SLEEP;
+        WriteReg(PCA9685_REG_MODE1, mode1);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        WriteReg(PCA9685_REG_MODE1, mode1 | PCA9685_MODE1_RESTART);
+        WriteReg(PCA9685_REG_MODE2, PCA9685_MODE2_OUTDRV | PCA9685_MODE2_OUTRE);
+        SetAllDuty(0);
+        ESP_LOGI(TAG, "PCA9685 @0x%02x ready, prescale=%lu", addr, (unsigned long)prescale);
+    }
+
+    // duty 0 keeps the line low all period, 4096 and above keeps it high
+    void SetDuty(uint8_t channel, uint16_t duty) {
+        if (channel > 15) {
+            return;
+        }
+        // register order for one channel: ON_L, ON_H, OFF_L, OFF_H
+        uint8_t values[4];
+        if (duty == 0) {
+            // ON at 4096 (never reached) and OFF at 0 -> held low all period
+            values[0] = 0x00;
+            values[1] = PCA9685_FULL_OFF;
+            values[2] = 0x00;
+            values[3] = 0x00;
+        } else if (duty >= PCA9685_MAX_DUTY) {
+            // ON at 0 and OFF at 4096 (never reached) -> held high all period
+            values[0] = 0x00;
+            values[1] = 0x00;
+            values[2] = 0x00;
+            values[3] = PCA9685_FULL_ON;
+        } else {
+            values[0] = 0x00;
+            values[1] = 0x00;
+            values[2] = duty & 0xff;
+            values[3] = (duty >> 8) & 0x0f;
+        }
+        WriteRegs(PCA9685_REG_LED0_ON_L + channel * PCA9685_CHANNEL_STRIDE, values, 4);
+    }
+
+    void SetAllDuty(uint16_t duty) {
+        uint8_t on_values[2] = {0x00, 0x00};
+        uint8_t off_values[2] = {static_cast<uint8_t>(duty & 0xff),
+                                 static_cast<uint8_t>((duty >> 8) & 0x0f)};
+        if (duty == 0) {
+            on_values[1] = PCA9685_FULL_OFF;
+            off_values[0] = 0x00;
+            off_values[1] = 0x00;
+        } else if (duty >= PCA9685_MAX_DUTY) {
+            off_values[0] = 0x00;
+            off_values[1] = PCA9685_FULL_ON;
+        }
+        WriteRegs(PCA9685_REG_ALL_LED_ON_L, on_values, 2);
+        WriteRegs(PCA9685_REG_ALL_LED_OFF_L, off_values, 2);
+    }
+};
+
+/*
+ * One TB6612FNG half-bridge: two direction inputs plus one PWM input.
+ * Full brake shorts both direction inputs high with the PWM off, which holds
+ * the geared motor against a slope instead of letting it coast.
+ */
+#define MOTOR_FULL_ON  (PCA9685_MAX_DUTY + 1)
+
+class Tb6612Motor {
+public:
+    Tb6612Motor(Pca9685* pwm, uint8_t ina_ch, uint8_t inb_ch, uint8_t pwm_ch)
+        : pwm_(pwm), ina_ch_(ina_ch), inb_ch_(inb_ch), pwm_ch_(pwm_ch) {}
+
+    // percent: -100 (full speed back) .. 100 (full speed forward), 0 = brake
+    void SetSpeed(int percent) {
+        if (percent < -100) {
+            percent = -100;
+        } else if (percent > 100) {
+            percent = 100;
+        }
+        int duty = abs(percent) * PCA9685_MAX_DUTY / 100;
+        if (percent == 0) {
+            Brake();
+            return;
+        }
+        if (percent > 0) {
+            pwm_->SetDuty(ina_ch_, MOTOR_FULL_ON);
+            pwm_->SetDuty(inb_ch_, 0);
+        } else {
+            pwm_->SetDuty(ina_ch_, 0);
+            pwm_->SetDuty(inb_ch_, MOTOR_FULL_ON);
+        }
+        pwm_->SetDuty(pwm_ch_, static_cast<uint16_t>(duty));
+        last_percent_ = percent;
+    }
+
+    void Brake() {
+        pwm_->SetDuty(ina_ch_, MOTOR_FULL_ON);
+        pwm_->SetDuty(inb_ch_, MOTOR_FULL_ON);
+        pwm_->SetDuty(pwm_ch_, 0);
+        last_percent_ = 0;
+    }
+
+    void Coast() {
+        pwm_->SetDuty(ina_ch_, 0);
+        pwm_->SetDuty(inb_ch_, 0);
+        pwm_->SetDuty(pwm_ch_, 0);
+        last_percent_ = 0;
+    }
+
+    int last_percent() const { return last_percent_; }
+
+private:
+    Pca9685* pwm_;
+    uint8_t ina_ch_;
+    uint8_t inb_ch_;
+    uint8_t pwm_ch_;
+    int last_percent_ = 0;
+};
+
 class LichuangDevBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
@@ -111,6 +271,10 @@ private:
     PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
     Servo* pan_servo_ = nullptr;
     Servo* tilt_servo_ = nullptr;
+    Pca9685* pca9685_ = nullptr;
+    Tb6612Motor* left_motor_ = nullptr;
+    Tb6612Motor* right_motor_ = nullptr;
+    esp_timer_handle_t drive_stop_timer_ = nullptr;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -322,6 +486,57 @@ private:
         tilt_servo_->Init();
     }
 
+    void StopDrive() {
+        if (left_motor_ == nullptr || right_motor_ == nullptr) {
+            return;
+        }
+        left_motor_->Brake();
+        right_motor_->Brake();
+        ESP_LOGI(TAG, "Drive braked");
+    }
+
+    void InitializeDrive() {
+        // The chip is optional hardware on the I2C expansion connector: probe it
+        // first so a robot without wheels still boots cleanly.
+        if (i2c_master_probe(i2c_bus_, PCA9685_I2C_ADDR, 100) != ESP_OK) {
+            ESP_LOGW(TAG, "PCA9685 @0x%02x not found, drive tools disabled", PCA9685_I2C_ADDR);
+            return;
+        }
+
+        pca9685_ = new Pca9685(i2c_bus_, PCA9685_I2C_ADDR, PCA9685_PWM_FREQ_HZ);
+        left_motor_ = new Tb6612Motor(pca9685_, MOTOR_LEFT_INA_CH, MOTOR_LEFT_INB_CH,
+                                      MOTOR_LEFT_PWM_CH);
+        right_motor_ = new Tb6612Motor(pca9685_, MOTOR_RIGHT_INA_CH, MOTOR_RIGHT_INB_CH,
+                                       MOTOR_RIGHT_PWM_CH);
+        left_motor_->Brake();
+        right_motor_->Brake();
+
+        const esp_timer_create_args_t stop_timer_args = {
+            .callback = [](void* arg) {
+                static_cast<LichuangDevBoard*>(arg)->StopDrive();
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "drive_stop",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&stop_timer_args, &drive_stop_timer_));
+        ESP_LOGI(TAG, "Drive ready: PCA9685 @0x%02x -> TB6612 -> 2x N20", PCA9685_I2C_ADDR);
+    }
+
+    // Same NVS key the provisioning portal writes and ota.cc reads.
+    void InitializeOtaUrl() {
+        Settings settings("wifi", true);
+        std::string url = settings.GetString("ota_url");
+        if (url.empty()) {
+            settings.SetString("ota_url", LOCAL_OTA_URL);
+            ESP_LOGI(TAG, "No OTA URL configured, falling back to the local brain: %s",
+                     LOCAL_OTA_URL);
+        } else {
+            ESP_LOGI(TAG, "OTA URL: %s", url.c_str());
+        }
+    }
+
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.system.reconfigure_wifi",
@@ -355,6 +570,53 @@ private:
                 return std::string(message);
             });
 
+        // Wheeled drive: PCA9685 on the I2C expansion connector -> TB6612FNG -> 2x N20
+        InitializeDrive();
+        if (pca9685_ != nullptr) {
+            mcp_server.AddTool("self.drive.set_speed",
+                "驱动桌面机器人的两个轮子（差速转向）。\n"
+                "left / right: -100~100 的速度百分比，正数前进、负数后退、0 为刹停该侧。\n"
+                "直行前进 = left=60,right=60；原地左转 = left=-40,right=40；原地右转 = left=40,right=-40。\n"
+                "duration_seconds: 大于 0 时到时自动刹停两轮，用于\"往前走 3 秒\"这类动作；填 0 表示持续运动，需要另一次调用才停。",
+                PropertyList({
+                    Property("left", kPropertyTypeInteger, 0, -100, 100),
+                    Property("right", kPropertyTypeInteger, 0, -100, 100),
+                    Property("duration_seconds", kPropertyTypeInteger, 0, 0, 30)
+                }),
+                [this](const PropertyList& properties) -> ReturnValue {
+                    int left = properties["left"].value<int>();
+                    int right = properties["right"].value<int>();
+                    int duration = properties["duration_seconds"].value<int>();
+                    left_motor_->SetSpeed(left);
+                    right_motor_->SetSpeed(right);
+                    if (drive_stop_timer_ != nullptr) {
+                        esp_timer_stop(drive_stop_timer_);
+                        if (duration > 0) {
+                            esp_timer_start_once(drive_stop_timer_,
+                                                 static_cast<uint64_t>(duration) * 1000000);
+                        }
+                    }
+                    char message[96];
+                    if (duration > 0) {
+                        snprintf(message, sizeof(message),
+                                 "轮子 左%d%% 右%d%%，%d 秒后自动刹停", left, right, duration);
+                    } else {
+                        snprintf(message, sizeof(message), "轮子 左%d%% 右%d%%，持续运动", left, right);
+                    }
+                    return std::string(message);
+                });
+
+            mcp_server.AddTool("self.drive.stop",
+                "立即刹停桌面机器人的两个轮子（短接刹车，能停住坡道上的车）。",
+                PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                    if (drive_stop_timer_ != nullptr) {
+                        esp_timer_stop(drive_stop_timer_);
+                    }
+                    StopDrive();
+                    return std::string("轮子已刹停");
+                });
+        }
+
         // Allow switching between press-to-talk (长按说话) and click-to-talk (单击唤醒)
         press_to_talk_tool_ = new PressToTalkMcpTool();
         press_to_talk_tool_->Initialize();
@@ -362,6 +624,7 @@ private:
 
 public:
     LichuangDevBoard() : boot_button_(BOOT_BUTTON_GPIO) {
+        InitializeOtaUrl();
         InitializeI2c();
         InitializeSpi();
         InitializeSt7789Display();
