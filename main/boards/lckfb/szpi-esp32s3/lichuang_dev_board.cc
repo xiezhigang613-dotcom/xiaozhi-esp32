@@ -16,10 +16,11 @@
 #include <driver/i2c_master.h>
 #include <driver/ledc.h>
 #include <driver/spi_common.h>
-#include <driver/esp_timer.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <cstdlib>
+#include <cstdio>
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
@@ -220,7 +221,7 @@ public:
         } else if (percent > 100) {
             percent = 100;
         }
-        int duty = abs(percent) * PCA9685_MAX_DUTY / 100;
+        int duty = std::abs(percent) * PCA9685_MAX_DUTY / 100;
         if (percent == 0) {
             Brake();
             return;
